@@ -1,0 +1,33 @@
+{
+  "expo": {
+    "name": "Gold Purity Estimator",
+    "slug": "gold-purity-estimator",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "Take photos of the object for volume estimation.",
+        "NSPhotoLibraryUsageDescription": "Choose object photos for volume estimation."
+      }
+    },
+    "android": {
+      "permissions": [
+        "CAMERA",
+        "READ_MEDIA_IMAGES"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Choose object photos for volume estimation.",
+          "cameraPermission": "Take photos of the object for volume estimation."
+        }
+      ],
+      "expo-asset",
+      "expo-font"
+    ]
+  }
+}
