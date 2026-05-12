@@ -178,9 +178,291 @@ def compute_scale_from_ref_prototype(
     raise ValueError("Square not detected. Try adjusting threshold_value.")
 
 
+def _background_border_mask(shape: tuple[int, int], margin_ratio: float = 0.06) -> np.ndarray:
+    h, w = shape
+    margin = max(12, int(min(h, w) * margin_ratio))
+    mask = np.zeros((h, w), dtype=bool)
+    mask[:margin, :] = True
+    mask[-margin:, :] = True
+    mask[:, :margin] = True
+    mask[:, -margin:] = True
+    return mask
+
+
+def _exclude_reference_region(
+    shape: tuple[int, int],
+    ref_bbox: tuple[int, int, int, int] | None = None,
+    ref_square_size_px: int | None = None,
+) -> np.ndarray:
+    h, w = shape
+    valid = np.ones((h, w), dtype=bool)
+    if ref_bbox is None:
+        return valid
+
+    x, y, bw, bh = ref_bbox
+    pad = int(max(bw, bh, ref_square_size_px or 0) * 0.35)
+    x0 = max(0, x - pad)
+    y0 = max(0, y - pad)
+    x1 = min(w, x + bw + pad)
+    y1 = min(h, y + bh + pad)
+    valid[y0:y1, x0:x1] = False
+    return valid
+
+
+def _restore_background_holes(
+    mask: np.ndarray,
+    contour: np.ndarray,
+    gray: np.ndarray,
+    bg_mean: float,
+    bg_similarity: float,
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    contours, hierarchy = cv2.findContours(mask.copy(), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None:
+        return mask, []
+
+    hole_contours: list[np.ndarray] = []
+    hierarchy = hierarchy[0]
+    contour_idx = None
+    for i, candidate in enumerate(contours):
+        if candidate.shape == contour.shape and np.array_equal(candidate, contour):
+            contour_idx = i
+            break
+    if contour_idx is None:
+        contour_idx = max(
+            range(len(contours)),
+            key=lambda idx: cv2.contourArea(contours[idx]),
+        )
+
+    updated = mask.copy()
+    for i, hinfo in enumerate(hierarchy):
+        if hinfo[3] != contour_idx:
+            continue
+
+        inner = contours[i]
+        inner_region_mask = np.zeros(gray.shape, dtype=np.uint8)
+        cv2.drawContours(inner_region_mask, [inner], -1, 255, -1)
+        inner_mean = cv2.mean(gray, mask=inner_region_mask)[0]
+        ratio = inner_mean / bg_mean if bg_mean > 0 else 0
+
+        if ratio >= bg_similarity:
+            cv2.drawContours(updated, [inner], -1, 0, -1)
+            hole_contours.append(inner)
+
+    return updated, hole_contours
+
+
+def segment_object_reflection_robust(
+    img: np.ndarray,
+    ref_square_size_px: int | None = None,
+    ref_bbox: tuple[int, int, int, int] | None = None,
+    bg_similarity: float = 0.80,
+    allow_holes: bool = True,
+    min_component_area: int = 400,
+    edge_low: int = 35,
+    edge_high: int = 120,
+) -> dict:
+    """Segment reflective or dark objects against paper backgrounds.
+
+    The key idea is to stop relying on "dark object on light paper" thresholding.
+    We instead:
+    1) model the paper background from the image borders in LAB space,
+    2) use chroma distance (`a/b`) as the primary, shadow-resistant cue,
+    3) select the strongest non-reference component from that chroma mask,
+    4) fall back to the general LAB+GrabCut path only when chroma is too weak,
+       which protects darker neutral objects without letting shadows dominate
+       reflective ones.
+    """
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    border = _background_border_mask((h, w))
+    valid = _exclude_reference_region((h, w), ref_bbox=ref_bbox, ref_square_size_px=ref_square_size_px)
+    bg_pixels = lab[border & valid]
+    if len(bg_pixels) == 0:
+        raise ValueError("Not enough paper background pixels for reflective-object segmentation.")
+
+    bg_median = np.median(bg_pixels, axis=0)
+    delta_ab = np.linalg.norm(lab[:, :, 1:] - bg_median[1:], axis=2)
+    bg_delta_ab = delta_ab[border & valid]
+    chroma_threshold = max(float(np.percentile(bg_delta_ab, 99.5)), 5.0)
+
+    chroma_mask = (delta_ab > chroma_threshold).astype(np.uint8) * 255
+    chroma_mask = cv2.morphologyEx(chroma_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
+    chroma_mask = cv2.morphologyEx(chroma_mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8), iterations=1)
+    chroma_mask[~valid] = 0
+
+    n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(chroma_mask, connectivity=8)
+    best_label = None
+    best_score = -math.inf
+    img_cx = w / 2.0
+    img_cy = h / 2.0
+    for label_id in range(1, n_labels):
+        area = stats[label_id, cv2.CC_STAT_AREA]
+        if area < min_component_area:
+            continue
+
+        x = stats[label_id, cv2.CC_STAT_LEFT]
+        y = stats[label_id, cv2.CC_STAT_TOP]
+        bw = stats[label_id, cv2.CC_STAT_WIDTH]
+        bh = stats[label_id, cv2.CC_STAT_HEIGHT]
+        cx, cy = centroids[label_id]
+
+        border_touch = x == 0 or y == 0 or x + bw >= w or y + bh >= h
+        score = float(area)
+        score -= 30000 if border_touch else 0
+        score -= 0.0015 * ((cx - img_cx) ** 2 + (cy - img_cy) ** 2)
+
+        if ref_square_size_px is not None:
+            aspect = bw / bh if bh else 0
+            size_gap = abs(bw - ref_square_size_px) + abs(bh - ref_square_size_px)
+            if 0.8 <= aspect <= 1.2 and size_gap < ref_square_size_px * 0.35:
+                score -= 25000
+
+        if score > best_score:
+            best_score = score
+            best_label = label_id
+
+    use_threshold_fallback = best_label is None
+    if best_label is None:
+        seed_mask = np.zeros((h, w), dtype=np.uint8)
+    else:
+        seed_mask = np.where(labels == best_label, 255, 0).astype(np.uint8)
+        seed_area = cv2.countNonZero(seed_mask)
+        seed_mean_delta = float(delta_ab[seed_mask > 0].mean()) if seed_area > 0 else 0.0
+        chroma_confidence = (seed_mean_delta - chroma_threshold) / (chroma_threshold + 1e-6)
+
+        # Low-chroma matte objects are better served by the original threshold/
+        # edge pipeline. This also prevents broad paper shadows from being
+        # treated as object material when the chroma signal is weak.
+        if seed_area < 0.003 * h * w or chroma_confidence < 0.35:
+            use_threshold_fallback = True
+
+    if use_threshold_fallback:
+        fallback_mode = "auto" if allow_holes else "threshold"
+        fallback = segment_object_prototype(
+            img,
+            ref_square_size_px=ref_square_size_px,
+            ref_bbox=ref_bbox,
+            bg_similarity=bg_similarity,
+            close_iterations=3,
+            edge_low=edge_low,
+            edge_high=edge_high,
+            segmentation_mode=fallback_mode,
+            allow_holes=allow_holes,
+            shadow_suppression=True,
+            edge_support_min_ratio=0.10,
+            min_component_area=min_component_area,
+        )
+        mask = fallback["mask"].copy()
+    else:
+        ys, xs = np.where(seed_mask > 0)
+        x0 = int(xs.min())
+        x1 = int(xs.max())
+        y0 = int(ys.min())
+        y1 = int(ys.max())
+
+        pad_x = int((x1 - x0 + 1) * 0.25) + 20
+        pad_y = int((y1 - y0 + 1) * 0.25) + 20
+        x0 = max(0, x0 - pad_x)
+        x1 = min(w - 1, x1 + pad_x)
+        y0 = max(0, y0 - pad_y)
+        y1 = min(h - 1, y1 + pad_y)
+
+        crop = img[y0 : y1 + 1, x0 : x1 + 1].copy()
+        crop_seed = seed_mask[y0 : y1 + 1, x0 : x1 + 1]
+        gc_mask = np.full(crop.shape[:2], cv2.GC_PR_BGD, np.uint8)
+        gc_mask[0, :] = cv2.GC_BGD
+        gc_mask[-1, :] = cv2.GC_BGD
+        gc_mask[:, 0] = cv2.GC_BGD
+        gc_mask[:, -1] = cv2.GC_BGD
+
+        sure_fg = cv2.erode(crop_seed, np.ones((7, 7), np.uint8), iterations=1)
+        probable_fg = cv2.dilate(crop_seed, np.ones((11, 11), np.uint8), iterations=1)
+        gc_mask[probable_fg > 0] = cv2.GC_PR_FGD
+        gc_mask[sure_fg > 0] = cv2.GC_FGD
+
+        bgd_model = np.zeros((1, 65), np.float64)
+        fgd_model = np.zeros((1, 65), np.float64)
+        cv2.grabCut(crop, gc_mask, None, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_MASK)
+
+        crop_mask = np.where(
+            (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD),
+            255,
+            0,
+        ).astype(np.uint8)
+        crop_mask = cv2.morphologyEx(crop_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
+        crop_mask = cv2.morphologyEx(crop_mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8), iterations=1)
+
+        # Keep the refined mask near the original chroma seed so soft shadows
+        # that touch the object do not grow into the final contour.
+        allowed_region = cv2.dilate(crop_seed, np.ones((35, 35), np.uint8), iterations=1)
+        crop_mask = cv2.bitwise_and(crop_mask, allowed_region)
+
+        mask = np.zeros((h, w), dtype=np.uint8)
+        mask[y0 : y1 + 1, x0 : x1 + 1] = crop_mask
+
+    n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if n_labels <= 1:
+        raise ValueError("Object mask is empty after reflective-object cleanup.")
+
+    best_component = None
+    best_component_score = -math.inf
+    for label_id in range(1, n_labels):
+        area = stats[label_id, cv2.CC_STAT_AREA]
+        if area < min_component_area:
+            continue
+
+        x = stats[label_id, cv2.CC_STAT_LEFT]
+        y = stats[label_id, cv2.CC_STAT_TOP]
+        bw = stats[label_id, cv2.CC_STAT_WIDTH]
+        bh = stats[label_id, cv2.CC_STAT_HEIGHT]
+        cx, cy = centroids[label_id]
+
+        border_touch = x == 0 or y == 0 or x + bw >= w or y + bh >= h
+        score = float(area)
+        score -= 30000 if border_touch else 0
+        score -= 0.0015 * ((cx - img_cx) ** 2 + (cy - img_cy) ** 2)
+
+        if score > best_component_score:
+            best_component_score = score
+            best_component = label_id
+
+    if best_component is None:
+        raise ValueError("Could not isolate a valid object component after cleanup.")
+
+    mask = np.where(labels == best_component, 255, 0).astype(np.uint8)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise ValueError("Object mask is empty after reflective-object cleanup.")
+
+    obj_contour = max(contours, key=cv2.contourArea)
+
+    bg_mask = cv2.bitwise_not(mask)
+    bg_mean = cv2.mean(gray, mask=bg_mask)[0]
+    hole_contours: list[np.ndarray] = []
+    if allow_holes:
+        mask, hole_contours = _restore_background_holes(
+            mask,
+            obj_contour,
+            gray,
+            bg_mean=bg_mean,
+            bg_similarity=bg_similarity,
+        )
+
+    return {
+        "mask": mask,
+        "contour": obj_contour,
+        "holes": hole_contours,
+        "hull": cv2.convexHull(obj_contour),
+    }
+
+
 def segment_object_prototype(
     img: np.ndarray,
     ref_square_size_px: int | None = None,
+    ref_bbox: tuple[int, int, int, int] | None = None,
     bg_similarity: float = 0.80,
     close_iterations: int = 2,
     edge_low: int = 50,
@@ -192,6 +474,18 @@ def segment_object_prototype(
     min_component_area: int = 250,
 ) -> dict:
     """Match prototype.ipynb object segmentation for quick mode."""
+    if segmentation_mode == "robust":
+        return segment_object_reflection_robust(
+            img,
+            ref_square_size_px=ref_square_size_px,
+            ref_bbox=ref_bbox,
+            bg_similarity=bg_similarity,
+            allow_holes=allow_holes,
+            min_component_area=min_component_area,
+            edge_low=edge_low,
+            edge_high=edge_high,
+        )
+
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
